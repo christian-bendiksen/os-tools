@@ -86,6 +86,9 @@ pub struct Progress {
 impl Progress {
     /// Return the completion as a percentage
     pub fn pct(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
         self.completed as f32 / self.total as f32
     }
 }
