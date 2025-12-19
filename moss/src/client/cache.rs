@@ -26,7 +26,32 @@ use crate::{Installation, package, request};
 #[derive(Debug, Clone, Default)]
 pub struct UnpackingInProgress(Arc<Mutex<HashSet<PathBuf>>>);
 
+/// RAII guard that automatically removes the path
+/// from in-progress tracking when dropped.
+pub struct InProgressGuard {
+    owner: UnpackingInProgress,
+    path: Option<PathBuf>,
+}
+
 impl UnpackingInProgress {
+    /// Attempt to exclusively acquire a path for unpacking.
+    ///
+    /// Returns `Some(InProgressGuard)` if the path was
+    /// successfully acquired, or `None` if it was already
+    /// in progress.
+    pub fn acquire(&self, path: PathBuf) -> Option<InProgressGuard> {
+        let mut lock = self.0.lock().expect("mutex lock");
+
+        if lock.insert(path.clone()) {
+            Some(InProgressGuard {
+                owner: self.clone(),
+                path: Some(path),
+            })
+        } else {
+            None
+        }
+    }
+
     /// Marks the provided path as "in-progress".
     ///
     /// Returns `true` if the path was added and
@@ -38,6 +63,15 @@ impl UnpackingInProgress {
     /// No longer unpacking
     pub fn remove(&self, path: &PathBuf) {
         self.0.lock().expect("mutex lock").remove(path);
+    }
+}
+
+/// Removes the path from the in-progress set.
+impl Drop for InProgressGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            self.owner.remove(&path);
+        }
     }
 }
 
@@ -218,15 +252,14 @@ impl Download {
             .map(|idx| {
                 let path = asset_path(&self.installation, &format!("{:02x}", idx.digest));
 
-                // If file is already being unpacked by another worker, skip
-                // to prevent clobbering IO
-                if !unpacking_in_progress.add(path.clone()) {
-                    return Ok(());
-                }
+                // Acquire in-progress guard.
+                let _guard = match unpacking_in_progress.acquire(path.clone()) {
+                    Some(guard) => guard,
+                    None => return Ok(()),
+                };
 
                 // This asset already exists
                 if path.exists() {
-                    unpacking_in_progress.remove(&path);
                     return Ok(());
                 }
 
@@ -243,9 +276,6 @@ impl Download {
                 let mut output = File::create(&path)?;
 
                 io::copy(&mut split_file, &mut output)?;
-
-                // Remove file from in-progress
-                unpacking_in_progress.remove(&path);
 
                 Ok(())
             })
